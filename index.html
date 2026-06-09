@@ -91,8 +91,7 @@ body {
 }
 		</style>
 		<link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
-<link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
-
+		<link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
 	</head>
 	<body>
 		<canvas id="canvas">
@@ -111,7 +110,10 @@ body {
 
 		<script src="index.js"></script>
 		<script>
-const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":true,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":164346604,"index.wasm":36160334},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+// Merged .pck size used for progress reporting (sum of all parts)
+const PCK_TOTAL_SIZE = 164346604;
+
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":true,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":PCK_TOTAL_SIZE,"index.wasm":36160334},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
 const GODOT_THREADS_ENABLED = false;
 const engine = new Engine(GODOT_CONFIG);
 
@@ -162,6 +164,65 @@ const engine = new Engine(GODOT_CONFIG);
 		initializing = false;
 	}
 
+	// Fetch all three .pck parts in parallel, tracking combined byte progress,
+	// then concatenate them and return an object URL Godot can load as index.pck.
+	async function mergePckParts(onProgress) {
+		const partUrls = [
+			'index.pck.part1',
+			'index.pck.part2',
+			'index.pck.part3',
+		];
+
+		let bytesLoaded = new Array(partUrls.length).fill(0);
+
+		function reportProgress() {
+			const loaded = bytesLoaded.reduce((a, b) => a + b, 0);
+			onProgress(loaded, PCK_TOTAL_SIZE);
+		}
+
+		const buffers = await Promise.all(
+			partUrls.map((url, i) =>
+				fetch(url).then((response) => {
+					if (!response.ok) {
+						throw new Error('Failed to fetch ' + url + ' (' + response.status + ')');
+					}
+					const reader = response.body.getReader();
+					const chunks = [];
+					return new ReadableStream({
+						start(controller) {
+							function push() {
+								reader.read().then(({ done, value }) => {
+									if (done) {
+										controller.close();
+										return;
+									}
+									chunks.push(value);
+									bytesLoaded[i] += value.byteLength;
+									reportProgress();
+									controller.enqueue(value);
+									push();
+								}).catch((err) => controller.error(err));
+							}
+							push();
+						},
+					});
+				}).then((stream) => new Response(stream).arrayBuffer())
+			)
+		);
+
+		// Concatenate all parts into a single ArrayBuffer
+		const totalBytes = buffers.reduce((sum, buf) => sum + buf.byteLength, 0);
+		const merged = new Uint8Array(totalBytes);
+		let offset = 0;
+		for (const buf of buffers) {
+			merged.set(new Uint8Array(buf), offset);
+			offset += buf.byteLength;
+		}
+
+		const blob = new Blob([merged], { type: 'application/octet-stream' });
+		return URL.createObjectURL(blob);
+	}
+
 	const missing = Engine.getMissingFeatures({
 		threads: GODOT_THREADS_ENABLED,
 	});
@@ -174,7 +235,6 @@ const engine = new Engine(GODOT_CONFIG);
 			} catch (err) {
 				serviceWorkerRegistrationPromise = Promise.reject(new Error('Service worker registration failed.'));
 			}
-			// There's a chance that installing the service worker would fix the issue
 			Promise.race([
 				serviceWorkerRegistrationPromise.then((registration) => {
 					if (registration != null) {
@@ -182,39 +242,56 @@ const engine = new Engine(GODOT_CONFIG);
 					}
 					return registration;
 				}).then(() => engine.installServiceWorker()),
-				// For some reason, `getRegistration()` can stall
 				new Promise((resolve) => {
 					setTimeout(() => resolve(), 2000);
 				}),
 			]).then(() => {
-				// Reload if there was no error.
 				window.location.reload();
 			}).catch((err) => {
 				console.error('Error while registering service worker:', err);
 			});
 		} else {
-			// Display the message as usual
 			const missingMsg = 'Error\nThe following features required to run Godot projects on the Web are missing:\n';
 			displayFailureNotice(missingMsg + missing.join('\n'));
 		}
 	} else {
 		setStatusMode('progress');
-		engine.startGame({
-			'onProgress': function (current, total) {
-				if (current > 0 && total > 0) {
-					statusProgress.value = current;
-					statusProgress.max = total;
-				} else {
-					statusProgress.removeAttribute('value');
-					statusProgress.removeAttribute('max');
+
+		// Merge the split .pck parts first, then hand the resulting object URL
+		// to Godot by temporarily overriding window.fetch to intercept the
+		// engine's request for 'index.pck' and redirect it to our blob URL.
+		mergePckParts((loaded, total) => {
+			statusProgress.value = loaded;
+			statusProgress.max = total;
+		}).then((mergedPckUrl) => {
+			const originalFetch = window.fetch.bind(window);
+			window.fetch = function (input, init) {
+				const url = (typeof input === 'string') ? input
+					: (input instanceof Request ? input.url : String(input));
+				if (url.endsWith('index.pck')) {
+					return originalFetch(mergedPckUrl, init);
 				}
-			},
-		}).then(() => {
-			setStatusMode('hidden');
-		}, displayFailureNotice);
+				return originalFetch(input, init);
+			};
+
+			engine.startGame({
+				'onProgress': function (current, total) {
+					if (current > 0 && total > 0) {
+						statusProgress.value = current;
+						statusProgress.max = total;
+					} else {
+						statusProgress.removeAttribute('value');
+						statusProgress.removeAttribute('max');
+					}
+				},
+			}).then(() => {
+				window.fetch = originalFetch; // restore original fetch
+				URL.revokeObjectURL(mergedPckUrl); // free blob memory
+				setStatusMode('hidden');
+			}, displayFailureNotice);
+		}).catch(displayFailureNotice);
 	}
 }());
 		</script>
 	</body>
 </html>
-
